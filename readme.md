@@ -14,8 +14,4 @@ The idea of this text editor is to use it on systems that behave a little like
 MS-DOS did, so a microcontroller with a command line and a file system. It is
 very niche and I do not expect it to be useful to anyone bar myself.
 
-To Do:
-- Implement more features
-- Check compatibility with edlin
-- Turn into a library, abstract out some of standard C features that make it
-  difficult to port to a microcontroller.
+

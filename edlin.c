@@ -1,12 +1,20 @@
-/* Text editor library inspired by edlin */
+/* Project: Text editor library inspired by edlin.
+ * License: The Unlicense
+ * Author:  Richard James Howe
+ * Repo:    <https://github.com/howerj/edlin>
+ *
+ * TODO: Abstract out FILE I/O and memory access, unit tests, turn into
+ * library, simplify and shrink code, make compatible with the original
+ * edlin, fix line numbers, add 'search', 'replace', 'cut' and 'copy'...
+ *
+ * Use <https://www.computerhope.com/edlin.htm> to get info for 
+ * compatibility. */
+#include "edlin.h"
 #include <stdio.h>
 #include <assert.h>
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
-
-/* TODO: Abstract out FILE I/O and memory access, allow different line endings,
- * implement the editor! Also tests, make sure ranges work. */
 
 #define MIN(X, Y) ((X) < (Y) ? (X) : (Y))
 #define MAX(X, Y) ((X) > (Y) ? (X) : (Y))
@@ -30,37 +38,38 @@ static void *reallocator(void *ptr, size_t sz) {
 
 static char *slurp(FILE *input, size_t *length, char *class, int include) {
 	assert(input);
+	assert(class);
 	char *m = NULL;
-	const size_t bsz = class ? 80 : 4096;
+	const size_t bsz = class ? 32 : 256;
+	int rchar = 0;
 	size_t sz = 0;
 	if (length)
 		*length = 0;
 	for (;;) {
 		if ((m = reallocator(m, sz + bsz + 1)) == NULL)
 			return NULL;
-		if (class) {
-			size_t j = 0;
-			int ch = 0, done = 0;
-			for (; ((ch = fgetc(input)) != EOF) && j < bsz; ) {
-				done = !!strchr(class, ch);
-				if (include || !done)
-					m[sz + j++] = ch;
-				if (done)
-					break;
-			}
-			sz += j;
-			if (done || ch == EOF)
-				break;
-		} else {
-			size_t inc = fread(&m[sz], 1, bsz, input);
-			sz += inc;
-			if (inc != bsz)
+		size_t j = 0;
+		int ch = 0, done = 0;
+		for (; ((ch = fgetc(input)) != EOF) && j < bsz; ) {
+			rchar = 1;
+			done = !!strchr(class, ch);
+			if (include || !done)
+				m[sz + j++] = ch;
+			if (done)
 				break;
 		}
+		sz += j;
+		if (done || ch == EOF)
+			break;
 	}
-	m[sz] = '\0'; /* ensure NUL termination */
-	if (length)
-		*length = sz;
+	if (rchar) {
+		m[sz] = '\0'; /* ensure NUL termination */
+		if (length)
+			*length = sz;
+	} else {
+		free(m);
+		return NULL;
+	}
 	return m;
 }
 
@@ -131,7 +140,7 @@ static int load_file(edit_t *e, FILE *in, int interactive) {
 	assert(in);
 	size_t length = 0;
 	for (char *l = NULL;(l = slurp(in, &length, "\n", 0));) {
-		if (!length) { free(l); break; }
+		if (!length && !l) { free(l); break; }
 		if (!l) return -1;
 		if (interactive && !strcmp(l, e->eol)) { free(l); break; }
 		if (grow(e, 1) < 0) { free(l); destroy(e); return -1; }
@@ -169,17 +178,17 @@ static int save(edit_t *e, const char *file_name, size_t low, size_t high) {
 		(void)fprintf(e->msgs, "%s?\n", name);
 		return -1;
 	}
-	for (size_t i = low; i < high; i++)
-		if (fputs(e->lines[i], file) < 0) {
+	for (size_t i = low; i < high; i++) {
+		if (fprintf(file, "%s%s", e->lines[i], e->line_ending) < 0) {
 			r = -1;
 			break;
 		}
+	}
 	if (fclose(file) < 0)
 		return -1;
 	return r;
 }
 
-/* TODO: Fix line numbers, add {replace, cut/copy} */
 static int editor(edit_t *e) {
 	assert(e);
 	assert(e->cmds);
@@ -231,14 +240,14 @@ line numbers, '1' being the lower range, '2' being the upper.\n\n";
 			case 'p': if (print(e, 0, low, e->msgs) < 0)   return -1; break;
 			case 'd': if (delete(e, 0, low) < 0)           return -1; break;
 			case 'i': e->pos = low; if (load_file(e, e->cmds, 1) < 0) return -1; break;
-			case 't': 
-				e->pos = low; 
-				if (!line[0]) { 
+			case 't':
+				e->pos = low;
+				if (!line[0]) {
 					if (fputs("?\n", e->msgs) < 0)
 						return -1;
-					break; 
-				} 
-				(void)load_name(e, &line[1], 0); 
+					break;
+				}
+				(void)load_name(e, &line[1], 0);
 				break;
 			default: if (fputs("?\n", e->msgs) < 0)        return -1; break;
 			}
@@ -264,16 +273,16 @@ line numbers, '1' being the lower range, '2' being the upper.\n\n";
 	return 0;
 }
 
-static int edit(const char *file, FILE *cmds, FILE *msgs) {
-	assert(file);
+int edlin(const char *file, FILE *cmds, FILE *msgs) {
 	assert(cmds);
 	assert(msgs);
-	edit_t e = { 
-		.file_name = file, .line_ending = "\n", .eol = ".", 
+	edit_t e = {
+		.file_name = file ? file : "", .line_ending = "\n", .eol = ".",
 		.msgs = msgs, .cmds = cmds,
 	};
-	(void)load_name(&e, file, 0);
-	if (editor(&e) < 0) 
+	if (file)
+		(void)load_name(&e, file, 0);
+	if (editor(&e) < 0)
 		goto fail;
 	return destroy(&e);
 fail:
@@ -281,11 +290,4 @@ fail:
 	return -1;
 }
 
-int main(int argc, char **argv) {
-	if (argc != 2) {
-		(void)fprintf(stderr, "usage: %s file\n", argv[0]);
-		return 1;
-	}
-	return -edit(argv[1], stdin, stdout);
-}
 
