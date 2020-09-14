@@ -5,7 +5,8 @@
  *
  * TODO: Abstract out FILE I/O and memory access, unit tests, turn into
  * library, simplify and shrink code, make compatible with the original
- * edlin, fix line numbers, add 'search', 'replace', 'cut' and 'copy'...
+ * edlin, fix line numbers, add 'search', 'replace', 'copy', 'move',
+ * memory limits/store on disk, better API, escaping, keep it small...
  *
  * Use <https://www.computerhope.com/edlin.htm> to get info for 
  * compatibility. */
@@ -16,6 +17,10 @@
 #include <stdlib.h>
 #include <ctype.h>
 
+#ifndef VERSION
+#define VERSION (0x000900ul)
+#endif
+
 #define MIN(X, Y) ((X) < (Y) ? (X) : (Y))
 #define MAX(X, Y) ((X) > (Y) ? (X) : (Y))
 
@@ -24,7 +29,7 @@ typedef struct {
 	char **lines;
 	size_t count, pos;
 	FILE *msgs, *cmds;
-	int fatal;
+	int fatal, verbose;
 } edit_t;
 
 static void *reallocator(void *ptr, size_t sz) {
@@ -40,12 +45,12 @@ static char *slurp(FILE *input, size_t *length, char *class, int include) {
 	assert(input);
 	assert(class);
 	char *m = NULL;
-	const size_t bsz = class ? 32 : 256;
+	const size_t bsz = 32;
 	int rchar = 0;
 	size_t sz = 0;
 	if (length)
 		*length = 0;
-	for (;;) {
+	for (;;) { /* TODO: Simplify */
 		if ((m = reallocator(m, sz + bsz + 1)) == NULL)
 			return NULL;
 		size_t j = 0;
@@ -73,11 +78,11 @@ static char *slurp(FILE *input, size_t *length, char *class, int include) {
 	return m;
 }
 
-static int question(edit_t *e, FILE *msgs) {
+static int question(edit_t *e) {
 	assert(e);
-	if (fprintf(msgs, "?%s", e->line_ending) < 0)
+	if (fprintf(e->msgs, "?%s", e->line_ending) < 0)
 		return -1;
-	return 0;
+	return -1;
 }
 
 static int destroy(edit_t *e) {
@@ -105,17 +110,16 @@ static int grow(edit_t *e, size_t more) {
 	return 0;
 }
 
-static int print(edit_t *e, size_t low, size_t high, FILE *msgs) {
+static int print(edit_t *e, size_t low, size_t high) {
 	assert(e);
-	assert(msgs);
 	assert(e->line_ending);
-	if (low > high)
-		return question(e, msgs);
+	if (low > high || high > e->count)
+		return question(e);
 	for (size_t i = low; i < high; i++) {
-		if (fprintf(msgs, "%4u:\t%s%s", (unsigned)i, e->lines[i], e->line_ending) < 0)
+		if (fprintf(e->msgs, "%4u:\t%s%s", (unsigned)i, e->lines[i], e->line_ending) < 0)
 			return -1;
 		if (i == e->pos)
-			if (fprintf(msgs, "*%s", e->line_ending) < 0)
+			if (fprintf(e->msgs, "*%s", e->line_ending) < 0)
 				return -1;
 	}
 	return 0;
@@ -123,8 +127,8 @@ static int print(edit_t *e, size_t low, size_t high, FILE *msgs) {
 
 static int delete(edit_t *e, size_t low, size_t high) {
 	assert(e);
-	if (low > high)
-		return 1;
+	if (low > high || high > e->count)
+		return question(e);
 	for (size_t i = low; i < high; i++) {
 		free(e->lines[i]);
 		e->lines[i] = NULL;
@@ -139,7 +143,9 @@ static int load_file(edit_t *e, FILE *in, int interactive) {
 	assert(e);
 	assert(in);
 	size_t length = 0;
-	for (char *l = NULL;(l = slurp(in, &length, "\n", 0));) {
+	for (char *l = NULL;;) {
+		if (e->verbose && interactive) { if (fprintf(e->msgs, ":") < 0) return -1; }
+		l = slurp(in, &length, "\n", 0);
 		if (!length && !l) { free(l); break; }
 		if (!l) return -1;
 		if (interactive && !strcmp(l, e->eol)) { free(l); break; }
@@ -158,8 +164,11 @@ static int load_name(edit_t *e, const char *name, int interactive) {
 	assert(e);
 	assert(name);
 	FILE *in = fopen(name, "rb");
-	if (!in)
+	if (!in) {
+		if (e->verbose)
+			fprintf(e->msgs, "failed to load file %s", name);
 		return -1;
+	}
 	const int r = load_file(e, in, interactive);
 	if (fclose(in) < 0)
 		return -1;
@@ -171,46 +180,58 @@ static int save(edit_t *e, const char *file_name, size_t low, size_t high) {
 	assert(file_name);
 	int r = 0;
 	if (low > high || high > e->count)
-		return -1;
+		return question(e);
 	const char *name = file_name[0] ? file_name : e->file_name;
 	FILE *file = fopen(name, "wb");
 	if (!file) {
 		(void)fprintf(e->msgs, "%s?\n", name);
 		return -1;
 	}
-	for (size_t i = low; i < high; i++) {
-		if (fprintf(file, "%s%s", e->lines[i], e->line_ending) < 0) {
-			r = -1;
+	for (size_t i = low; i < high; i++)
+		if ((r = fprintf(file, "%s%s", e->lines[i], e->line_ending)) < 0)
 			break;
-		}
-	}
 	if (fclose(file) < 0)
 		return -1;
+	if (e->verbose)
+		if (fprintf(e->msgs, "saved '%s': %d\n", name, r) < 0)
+			r = -1;
 	return r;
+}
+
+static int search(edit_t *e, const char *string, size_t low, size_t high) {
+	assert(e);
+	assert(string);
+	if (low > high || high > e->count)
+		return question(e);
+	for (size_t i = low; i < high; i++)
+		if (strstr(e->lines[i], string)) {
+			if (e->verbose)
+				if (print(e, i, i) < 0)
+					return -1;
+			e->pos = i;
+			return 0;
+		}
+	e->pos = e->count;
+	return 0;
 }
 
 static int editor(edit_t *e) {
 	assert(e);
 	assert(e->cmds);
 	assert(e->msgs);
-	static const char *help = "\
-Primitive line editor, commands:\n\n\
-   1,2d       - delete lines, inclusive\n\
-   1,2sString - search lines\n\
-   1,2p       - print lines and update position\n\
-   1,2l       - print lines\n\
-   wString    - write to file, optionally supplied\n\
-   eString    - write to file, optionally supplied, and quit\n\
-   q          - quit\n\
-   a          - append to file and enter insert mode\n\
-   1t         - insert file at position\n\
-   1i         - edit at line and enter insert mode\n\
-   h          - print help\n\
-   ?          - print help\n\
-\n\
-To exit insert mode enter single '.' on a line. '1' and '2' are\n\
-line numbers, '1' being the lower range, '2' being the upper.\n\n";
-	unsigned low = -1, high = -1;
+
+static const char *help ="\
+edlin clone, MIT license, Richard James Howe, <https//github.com/howerj/edlin>\n\n\
+[#][,#]e<>  write file and quit | q           quit\n\
+[#][,#]w<>  write file          | [#][,#]l    list lines (no cursor update)\n\
+[#][,#]d    delete lines        | [#]i        insert at cursor or line\n\
+[#][,#]p    print lines         | a           insert at end of file\n\
+h           print help          | ?           print help\n\
+[#][,#]s$   search for string   | [#]t<>      transfer file into line\n\n\
+$ = string, <> = file, [] = optional, # = number. A single '.' on a new\n\
+line exits insert mode.\n\n";
+
+	unsigned long low = -1, high = -1;
 	int cnt = -1;
 	char line[256] = { 0, }, *c = NULL;
 	for (;fgets(line, sizeof (line) - 1, e->cmds);) {
@@ -220,44 +241,51 @@ line numbers, '1' being the lower range, '2' being the upper.\n\n";
 			if (line[low] == '\r' || line[low] == '\n')
 				line[low] = '\0';
 		/* TODO: Simplify argument parsing? */
-		if (sscanf(line, "%u,%u%n", &low, &high, &cnt) == 2) {
+		if (sscanf(line, "%lu , %lu %n", &low, &high, &cnt) == 2) {
 			low = MAX(low, 0);
-			high = MIN(high, (long)e->count);
+			high = MIN(high, e->count);
 			c = &line[cnt];
 			switch (tolower(c[0])) {
 			case 'l': e->pos = high; /* fall-through */
-			case 'p': if (print(e, low, high, e->msgs) < 0) return -1; break;
+			case 'p': if (print(e, low, high) < 0) return -1; break;
 			case 'd': if (delete(e, low, high) < 0) return -1; break;
-			case 's': /* TODO: Search and set pos */ break;
-			case 'w': (void)save(e, &line[1], low, high); break;
+			case 's': search(e, &line[1], low, high); break;
+			case 'e': /* fall-through */
+			case 'w': (void)save(e, &line[1], low, high); if (tolower(c[0]) == 'e') return 0; break;
 			default: if (fputs("?\n", e->msgs) < 0) return -1;
 			}
-		} else if (sscanf(line, "%u%n", &low, &cnt) == 1) {
+		} else if (sscanf(line, "%lu %n", &low, &cnt) == 1) {
 			low = MIN(e->count, MAX(low, 0));
+			high = MIN(e->count, low + 1ul);
 			c = &line[cnt];
 			switch (tolower(c[0])) {
+			case '\0': e->pos = low; break;
 			case 'l': e->pos = low; /* fall-through */
-			case 'p': if (print(e, 0, low, e->msgs) < 0)   return -1; break;
-			case 'd': if (delete(e, 0, low) < 0)           return -1; break;
+			case 'p': if (print(e, low, high) < 0)   return -1; break;
+			case 'd': if (delete(e, low, high) < 0)           return -1; break;
+			case 's': search(e, &line[1], low, high); break;
+			case 'e': /* fall-through */
+			case 'w': (void)save(e, &line[1], low, high); if (tolower(c[0]) == 'e') return 0; break;
 			case 'i': e->pos = low; if (load_file(e, e->cmds, 1) < 0) return -1; break;
 			case 't':
 				e->pos = low;
-				if (!line[0]) {
-					if (fputs("?\n", e->msgs) < 0)
-						return -1;
-					break;
-				}
+				if (!line[0]) { if (fputs("?\n", e->msgs) < 0) return -1; break; }
 				(void)load_name(e, &line[1], 0);
 				break;
 			default: if (fputs("?\n", e->msgs) < 0)        return -1; break;
 			}
-		} else {
-			c = &line[0];
+		} else { /* TODO: Apply consistent ranges, and use '%' and '.' characters to indicate all file and current line */
+			low = MIN(e->pos, MAX(low, 0));
+			high = MIN(e->count, low + 1ul);
+			c = &line[0]; /* TODO: Trim white-space */
 			switch (tolower(c[0])) {
 			case 'q': return 0;
+			case 'v': e->verbose++; break;
 			case '?': case 'h': if (fputs(help, e->msgs) < 0) return -1; break;
+			case 's': search(e, &line[1], 0, e->count); break;
 			case 'l': e->pos = e->count; /* fall-through */
-			case 'p': if (print(e, 0, e->count, e->msgs) < 0) return -1; break;
+			case 'p': if (print(e, 0, e->count) < 0) return -1; break;
+			case 'd': if (delete(e, low, high) < 0) return -1; break; 
 			case 'e': /* fall-through */
 			case 'w': (void)save(e, &line[1], 0, e->count);
 				if (tolower(c[0]) == 'e')
@@ -265,6 +293,11 @@ line numbers, '1' being the lower range, '2' being the upper.\n\n";
 				break;
 			case 'a': e->pos = e->count; /* fall-through */
 			case 'i': if (load_file(e, e->cmds, 1) < 0) return -1; break;
+			case 't': 
+				e->pos = e->count;
+				if (!line[0]) { if (fputs("?\n", e->msgs) < 0) return -1; break; }
+				(void)load_name(e, &line[1], 0);
+				break;
 			case ' ': case '\t': case '\r': case '\n': /* fall-through */
 			default: if (fputs("?\n", e->msgs) < 0) return -1;
 			}

@@ -15,6 +15,9 @@ ${TARGET}: main.o lib${TARGET}.a
 	${CC} ${CFLAGS} $^ -o $@
 	-strip ${TARGET}
 
+test: t ${TARGET}
+	./t
+
 clean:
 	git clean -dffx
 
