@@ -11,9 +11,8 @@ ${TARGET}.o: ${TARGET}.c ${TARGET}.h
 lib${TARGET}.a: ${TARGET}.o
 	ar rcs $@ $<
 
-${TARGET}: main.o lib${TARGET}.a
+${TARGET}: main.o lib${TARGET}.a	
 	${CC} ${CFLAGS} $^ -o $@
-	-strip ${TARGET}
 
 test: t ${TARGET}
 	./t
