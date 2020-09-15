@@ -1,4 +1,7 @@
-edlin
-*.o
+*.1
 *.a
+*.o
+*.tgz
 *.txt
+edlin
+install
