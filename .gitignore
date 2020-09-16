@@ -1,6 +1,9 @@
 *.1
 *.a
+*.dll
+*.exe
 *.o
+*.so
 *.tgz
 *.txt
 edlin

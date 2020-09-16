@@ -24,14 +24,16 @@ is like a simplified version of [ed](https://en.wikipedia.org/wiki/Ed_%28text_ed
 
 The idea of this text editor is to use it on systems that behave a little like
 MS-DOS did, so a microcontroller with a command line and a file system. It is
-very niche and I do not expect it to be useful to anyone bar myself.
+very niche and I do not expect it to be useful to anyone bar myself. The only
+dependencies should be on the standard C library, it should be fairly easy to
+port.
 
 # EXAMPLE
 
 An example creating a new file called 'hello.c' containing the standard C
 program:
 
-	$ ./edlin
+	$ ./edlin # or 'edlin.exe' for Windows users
 	i
 	#include <stdio.h>
 
@@ -56,6 +58,10 @@ is an optional argument. If a file name is not provided the file opened up for
 editing is used. Ranges behave differently depending on the command and which
 optional numbers are provided. A file pointer exists which is used and updated
 depending on the command and optional numbers provided.
+
+For numbers, the character '.' can be used for the current line number and '$' 
+can be used to mean the end of the file. For example '.,$d' would delete 
+everything from the current line up until the end of the file.
 
 * q
 
@@ -129,6 +135,21 @@ Copy a range of lines.
 * \[#\]\[,#\]r$
 
 Replace a range of lines.
+
+* #
+
+Edit a single line, updating the file position to the line after the one edited once
+editing is done. This does use '.' as an escape character, so if you need to insert
+a single '.' on a line then this is one way to do it.
+
+# KNOWN LIMITATIONS
+
+* The file that is being edited is loaded into RAM so files cannot be bigger
+than your memory.
+* 'unsigned long' is used to keep track of line numbers, and 'int' for line
+line lengths. The minimum values for these are 2^32 - 1 and 65535 
+respectively, so that limits the maximum line count and maximum line length
+to those values.
 
 # BUGS
 

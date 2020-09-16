@@ -1,5 +1,5 @@
-VERSION=0.9.1
-CFLAGS=-std=c99 -Wall -Wextra -pedantic -Os -DVERSION="\"${VERSION}\""
+VERSION=0.9.2
+CFLAGS=-std=c99 -Wall -Wextra -pedantic -Og -g -DVERSION="\"${VERSION}\""
 TARGET=edlin
 DESTDIR=install
 
@@ -17,13 +17,12 @@ lib${TARGET}.a: ${TARGET}.o
 
 ${TARGET}: main.o lib${TARGET}.a	
 	${CC} ${CFLAGS} $^ -o $@
-	-strip ${TARGET}
 
 test: t ${TARGET}
 	./t
 
 ${TARGET}.1: readme.md
-	pandoc -s -f markdown -t man $< -o $@
+	-pandoc -s -f markdown -t man $< -o $@
 
 install: ${TARGET} lib${TARGET}.a ${TARGET}.1 .git
 	install -p -D ${TARGET} ${DESTDIR}/bin/${TARGET}

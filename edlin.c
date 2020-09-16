@@ -6,10 +6,6 @@
 #ifndef VERSION
 #define VERSION "0.0.0" /* defined by build system */
 #endif
-/* TODO: Abstract out FILE I/O, make compatible with the original edlin,
- * multiple commands per line separated out by a ';',
- * fix line numbers, add 'replace', memory limits/store on disk, better API, escaping, keep it small,
- * Documentation in 'readme.md' file. More testing and assertions! */
 #include "edlin.h"
 #include <assert.h>
 #include <ctype.h>
@@ -21,19 +17,23 @@
 #define NELEMS(X) (sizeof (X) / sizeof (X[0]))
 #define MIN(X, Y) ((X) < (Y) ? (X) : (Y))
 #define MAX(X, Y) ((X) > (Y) ? (X) : (Y))
+#define DEFAULT_LINE_LENGTH (80ul)
+
+/* TODO: fix line numbers, better API, keep it small, more testing and assertions! */
 
 typedef struct {
-	const char *file_name, *line_ending, *eol;
 	char **lines;
-	size_t count, pos;
-	size_t line_length_limit, line_count_limit; /* 0 = limit disabled */
+	const char *file_name, *line_ending, *eol;
+	size_t count, pos;                          /* line count, line cursor */
+	size_t line_length_limit, line_count_limit; /* optional limits, 0 = limit disabled */
 	FILE *msgs, *cmds;
 	int fatal, verbose;
-	allocator_fn allocator;
-	void *arena;
-} edit_t;
+	allocator_fn allocator; /* memory allocator used in this editor */
+	void *arena;            /* memory arena (may be NULL) for allocator */
+	int (*fgetc)(FILE *in); /* TODO: Use this, replace fgets */
+	int (*vfprintf)(FILE *out, const char *fmt, va_list ap);
+} edlin_t;
 
-/* TODO: have a maximum number of allocations controlled from here? */
 static void *allocator(void *arena, void *ptr, const size_t oldsz, const size_t newsz) {
 	(void)arena;
 	if (newsz == 0) { free(ptr); return NULL; }
@@ -41,22 +41,22 @@ static void *allocator(void *arena, void *ptr, const size_t oldsz, const size_t 
 	return ptr;
 }
 
-static void *reallocator(edit_t *e, void *ptr, size_t sz) {
+static void *reallocator(edlin_t *e, void *ptr, size_t oldsz, size_t newsz) {
 	assert(e && e->allocator);
-	void *r = e->allocator(e->arena, ptr, 0, sz);
-	if (!r && sz) {
-		e->allocator(e->arena, ptr, 0, 0);
+	void *r = e->allocator(e->arena, ptr, oldsz, newsz);
+	if (!r && newsz) {
+		e->allocator(e->arena, ptr, oldsz, 0);
 		return NULL;
 	}
 	return r;
 }
 
-static void release(edit_t *e, void *ptr) {
+static void release(edlin_t *e, void *ptr) {
 	assert(e && e->allocator);
 	(void)e->allocator(e->arena, ptr, 0, 0);
 }
 
-static char *slurp(edit_t *e, FILE *input, size_t *length) {
+static char *slurp(edlin_t *e, FILE *input, size_t *length) {
 	assert(e);
 	assert(input);
 	assert(length);
@@ -68,9 +68,9 @@ static char *slurp(edit_t *e, FILE *input, size_t *length) {
 			release(e, m);
 			return NULL;
 		}
-		if ((sz + 1) > bsz) {
-			bsz += 80;
-			char *n = reallocator(e, m, bsz + 1);
+		if ((sz + 1ul) > bsz) {
+			bsz += DEFAULT_LINE_LENGTH;
+			char *n = reallocator(e, m, bsz - DEFAULT_LINE_LENGTH, bsz + 1);
 			if (!n) {
 				release(e, m);
 				return NULL;
@@ -89,19 +89,34 @@ static char *slurp(edit_t *e, FILE *input, size_t *length) {
 	return m;
 }
 
-static int msg(edit_t *e, const char *fmt, ...) {
+static int edprint(edlin_t *e, FILE *out, const char *fmt, ...) {
 	assert(e);
 	assert(e->msgs);
+	assert(e->vfprintf);
+	assert(out);
+	assert(fmt);
 	va_list ap;
 	va_start(ap, fmt);
-	const int r1 = vfprintf(e->msgs, fmt, ap);
+	const int r = e->vfprintf(out, fmt, ap);
 	va_end(ap);
-	const int r2 = fputs(e->line_ending, e->msgs);
+	return r;
+}
+
+static int msg(edlin_t *e, const char *fmt, ...) {
+	assert(e);
+	assert(e->msgs);
+	assert(e->vfprintf);
+	assert(fmt);
+	va_list ap;
+	va_start(ap, fmt);
+	const int r1 = e->vfprintf(e->msgs, fmt, ap);
+	va_end(ap);
+	const int r2 = edprint(e, e->msgs, "%s", e->line_ending);
 	e->fatal = r1 < 0 || r2 < 0;
 	return -(e->fatal);
 }
 
-static int question(edit_t *e) {
+static int question(edlin_t *e) {
 	assert(e);
 	return msg(e, "?");
 }
@@ -115,7 +130,7 @@ static char *duplicate(const char *s) {
 	return memcpy(r, s, sl);
 }
 
-static int destroy(edit_t *e) {
+static int destroy(edlin_t *e) {
 	if (!e)
 		return 0;
 	e->fatal = 1;
@@ -127,7 +142,7 @@ static int destroy(edit_t *e) {
 	return 0;
 }
 
-static int grow(edit_t *e, size_t more) {
+static int grow(edlin_t *e, size_t more) {
 	assert(e);
 	if (e->count + more < e->count)
 		return -1;
@@ -145,18 +160,79 @@ static int grow(edit_t *e, size_t more) {
 	return 0;
 }
 
-static int print(edit_t *e, size_t low, size_t high) {
+static int hexCharToNibble(int c) {
+	c = tolower(c);
+	if ('a' <= c && c <= 'f')
+		return 0xa + c - 'a';
+	return c - '0';
+}
+
+/* converts up to two characters and returns number of characters converted */
+static int hexStr2ToInt(const char *str, int *const val) {
+	assert(str);
+	assert(val);
+	*val = 0;
+	if (!isxdigit(*str))
+		return 0;
+	*val = hexCharToNibble(*str++);
+	if (!isxdigit(*str))
+		return 1;
+	*val = (*val << 4) + hexCharToNibble(*str);
+	return 2;
+}
+
+static int unescape(char *r, size_t length) {
+	assert(r);
+	if (!length)
+		return -1;
+	size_t k = 0;
+	for (size_t j = 0, ch = 0; (ch = r[j]) && k < length; j++, k++) {
+		if (ch == '\\') {
+			j++;
+			switch (r[j]) {
+			case '\0': return -1;
+			case '\n': k--;         break; /* multi-line hack (Unix line-endings only) */
+			case '\\': r[k] = '\\'; break;
+			case  'a': r[k] = '\a'; break;
+			case  'b': r[k] = '\b'; break;
+			case  'e': r[k] = 27;   break;
+			case  'f': r[k] = '\f'; break;
+			case  'n': r[k] = '\n'; break;
+			case  'r': r[k] = '\r'; break;
+			case  't': r[k] = '\t'; break;
+			case  'v': r[k] = '\v'; break;
+			case  'x': {
+				int val = 0;
+				const int pos = hexStr2ToInt(&r[j + 1], &val);
+				if (pos < 1)
+					return -2;
+				j += pos;
+				r[k] = val;
+				break;
+			}
+			default:
+				r[k] = r[j]; break;
+			}
+		} else {
+			r[k] = ch;
+		}
+	}
+	r[k] = '\0';
+	return k;
+}
+
+static int print(edlin_t *e, size_t low, size_t high) {
 	assert(e);
 	assert(e->line_ending);
 	if (low > high || high > e->count)
 		return question(e);
-	for (size_t i = low; i < high; i++)
+	for (size_t i = low; i < high; i++) /* NB. Might want to optionally limit line length that is printed */
 		if (msg(e, "%4u%c %s", (unsigned)i, i == e->pos ? '*' : ':', e->lines[i]) < 0)
 			return -1;
 	return 0;
 }
 
-static int delete(edit_t *e, size_t low, size_t high) {
+static int delete(edlin_t *e, size_t low, size_t high) {
 	assert(e);
 	if (low > high || high > e->count)
 		return question(e);
@@ -170,12 +246,14 @@ static int delete(edit_t *e, size_t low, size_t high) {
 	return 0;
 }
 
-static int load_file(edit_t *e, FILE *in, int interactive) {
+static int load_file(edlin_t *e, FILE *in, int interactive, size_t max_read) {
 	assert(e);
 	assert(in);
-	size_t length = 0;
-	for (char *l = NULL;;) {
-		if (e->verbose && interactive) { if (fputs(":", e->msgs) < 0) e->fatal = 1; }
+	size_t length = 0, read_in = 0;
+	for (char *l = NULL;;read_in++) {
+		if (max_read && read_in >= max_read)
+			return 0;
+		if (e->verbose && interactive) { if (edprint(e, e->msgs, ":") < 0) e->fatal = 1; }
 		l = slurp(e, in, &length);
 		if (!length && !l) { release(e, l); break; }
 		if (!l) return -1;
@@ -191,22 +269,24 @@ static int load_file(edit_t *e, FILE *in, int interactive) {
 	return 0;
 }
 
-static int load_name(edit_t *e, const char *name, int interactive) {
+static int load_name(edlin_t *e, char *name, int interactive, int escape) {
 	assert(e);
 	assert(name);
+	if (escape)
+		unescape(name, strlen(name) + 1ul);
 	FILE *in = fopen(name, "rb");
 	if (!in) {
 		if (e->verbose)
 			msg(e, "t '%s'?", name);
 		return -1;
 	}
-	const int r = load_file(e, in, interactive);
+	const int r = load_file(e, in, interactive, 0);
 	if (fclose(in) < 0)
 		return -1;
 	return r;
 }
 
-static int save(edit_t *e, const char *file_name, size_t low, size_t high) {
+static int save(edlin_t *e, const char *file_name, size_t low, size_t high) {
 	assert(e);
 	assert(file_name);
 	int r = 0;
@@ -220,7 +300,7 @@ static int save(edit_t *e, const char *file_name, size_t low, size_t high) {
 	}
 	for (size_t i = low; i < high; i++) {
 		assert(e->lines[i]);
-		if ((r = fprintf(file, "%s%s", e->lines[i], e->line_ending)) < 0)
+		if ((r = edprint(e, file, "%s%s", e->lines[i], e->line_ending)) < 0)
 			break;
 	}
 	if (fclose(file) < 0)
@@ -231,7 +311,7 @@ static int save(edit_t *e, const char *file_name, size_t low, size_t high) {
 	return r;
 }
 
-static int search(edit_t *e, const char *string, size_t low, size_t high) {
+static int search(edlin_t *e, const char *string, size_t low, size_t high) {
 	assert(e);
 	assert(string);
 	if (low > high || high > e->count)
@@ -248,22 +328,45 @@ static int search(edit_t *e, const char *string, size_t low, size_t high) {
 	return 0;
 }
 
-#if 0
-static int replace(edit_t *e, size_t from, size_t to, const char *match, const char *repl) {
+static int replace(edlin_t *e, size_t low, size_t high, const char *match, const char *repl) {
 	assert(e);
 	if (!match || !repl || low > high || high > e->count)
 		return question(e);
-	for (size_t i = 0; i < high; i++) {
-		char *m = strstr(e->lines[i], match);
-		if (m) {
-			// TODO: Cut match, if repl > match { grow }, redo search from end of new replacement
+	const size_t mlen = strlen(match), rlen = strlen(repl);
+	if (mlen == 0)
+		return question(e);
+	for (size_t i = low; i < high; i++) { /* Not terribly efficient, but it should work */
+		size_t llen = strlen(e->lines[i]);
+		char *l = e->lines[i], *ol = reallocator(e, NULL, 0, llen + 1ul);
+		if (!ol) { e->fatal = 1; return -1; }
+		size_t k = 0, ms = 0;
+		for (size_t j = 0; j < llen;) { /* global replacement */
+			char *m = strstr(&l[j], match);
+			if (m) {
+				if (ms == 0 && e->verbose)
+					msg(e, "%4ld: %s", l);
+				ms++;
+				if (rlen > mlen) {
+					ol = reallocator(e, ol, llen + ((ms - 1ul) * rlen), llen + (ms * rlen) + 1ul);
+					if (!ol) { e->fatal = 1; return -1; }
+				}
+				memcpy(&ol[k], &l[j], m - l);
+				k = m - l;
+				memcpy(&ol[k], repl, rlen);
+				j = ((size_t)(m - l)) + mlen;
+				k += rlen;
+			} else {
+				ol[k++] = l[j++];
+			}
 		}
+		ol[k] = '\0';
+		release(e, l);
+		e->lines[i] = ol;
 	}
 	return 0;
 }
-#endif
 
-static int move(edit_t *e, size_t from, size_t to, size_t count) {
+static int move(edlin_t *e, size_t from, size_t to, size_t count) {
 	assert(e);
 	if (to > e->count || from >= e->count || ((from + count) < from) || ((from + count) > e->count))
 		return question(e);
@@ -273,13 +376,13 @@ static int move(edit_t *e, size_t from, size_t to, size_t count) {
 		assert(to   + i < e->count);
 		assert(from + i < e->count);
 		char *t = e->lines[to + i];
-		e->lines[to + i] = e->lines[from + i];
+		e->lines[to   + i] = e->lines[from + i];
 		e->lines[from + i] = t;
 	}
 	return 0;
 }
 
-static int copy(edit_t *e, size_t from, size_t to, size_t lines, size_t count) {
+static int copy(edlin_t *e, size_t from, size_t to, size_t lines, size_t count) {
 	assert(e);
 	if (to > e->count || from >= e->count || ((from + lines) > e->count))
 		return question(e);
@@ -308,7 +411,19 @@ static int copy(edit_t *e, size_t from, size_t to, size_t lines, size_t count) {
 	return 0;
 }
 
-static int help(edit_t *e) {
+static int number(edlin_t *e, const char *line, unsigned long *out, int *cnt) {
+	assert(e);
+	assert(line);
+	assert(out);
+	assert(cnt);
+	*out = 0;
+	*cnt = 0;
+	if (line[0] == '.') { *out = e->pos;   *cnt = 1; return 1; }
+	if (line[0] == '$') { *out = e->count; *cnt = 1; return 1; }
+	return sscanf(line, "%lu%n", out, cnt); /* TODO: Remove dependency on sscanf */
+}
+
+static int help(edlin_t *e) {
 	assert(e);
 static const char *help_string ="\
 Program: " PROGRAM "\nVersion: " VERSION "\nLicense: " LICENSE "\nAuthor:  " AUTHOR "\n\
@@ -320,13 +435,14 @@ Email:   " EMAIL "\nRepo:    " REPO " \n\n\
 h           print help          | ?           print info\n\
 [#][,#]s$   search for string   | [#]t<>      transfer file into line\n\
 [#]v        set verbosity level | #,[#],#m    move lines\n\
-#,#,#,#c    copy lines          | [#][,#]r$   replace\n\
-\n$ = string, <> = file, [] = optional, # = number. A single '.' on a new\n\
-line exits insert mode.\n";
+[#][,#][,#][,#]c    copy lines  | [#][,#]r$   replace\n\
+#           edit single line    |\n\
+\n# = number ('.' for current line and '$' for end of file). $ = string,\n\
+<> = file, [] = optional, A single '.' on a new line exits insert mode.\n";
 	return msg(e, help_string);
 }
 
-static int edit_command(edit_t *e, char *line) {
+static int edit_command(edlin_t *e, char *line) {
 	assert(e);
 	assert(e->cmds);
 	assert(e->msgs);
@@ -336,9 +452,8 @@ static int edit_command(edit_t *e, char *line) {
 		if (line[i] == '\r' || line[i] == '\n')
 			line[i] = '\0';
 	int argc = 0, cnt = 0, tot = 0;
-	unsigned long argv[4] = { 0, };
-	/* TODO: Handle '.' (current line) and '$' (last line) characters */
-	for (argc = 0; argc < ((int)NELEMS(argv)) && 1 == sscanf(&line[tot], "%lu%n", &argv[argc], &cnt); argc++) {
+	unsigned long argv[4] = { 0, }; /* parse out number arguments */
+	for (argc = 0; argc < ((int)NELEMS(argv)) && 1 == number(e, &line[tot], &argv[argc], &cnt); argc++) {
 		tot += cnt;
 		if (line[tot] != ',') {
 			argc++;
@@ -346,49 +461,72 @@ static int edit_command(edit_t *e, char *line) {
 		}
 		tot++;
 	}
-	const int ch = line[tot];
-	const char *str = &line[tot + 1];
+	const int ch = line[tot]; /* our command */
+	char *str1 = &line[tot + (ch != '\0')], *str2 = NULL;
 	unsigned long low = MAX(argv[0], 0), high = MIN(argv[1] + 1, e->count);
-	if (argc == 1) {
+	if (argc == 1) { /* set defaults and min/max */
 		low = MIN(e->count, MAX(low, 0));
 		high = MIN(e->count, low + 1ul);
 	} else if (argc == 0) {
 		low = MAX(e->pos, MAX(low, 0));
 		high = MIN(e->count, low + 1ul);
 	}
+	for (size_t i = 0; str1[i]; i++) { /* parse out string arguments */
+		if (str1[i] == ',') {
+			str2 = &str1[i + 1];
+			str1[i] = '\0';
+		}
+		if (str1[i] == '\\' && str1[i + 1] == ',')
+			i++;
+	}
+	unescape(str1, strlen(str1) + 1ul);
+	if (str2)
+		unescape(str2, strlen(str2) + 1ul);
 
-	switch (ch) {
+	switch (ch) { /* TODO: More error checking on the number of arguments */
 	case 'q': if (argc != 0) { question(e); break; } return 1;
 	case 'm': move(e, low, high, argc == 3 ? argv[2] : 1); break;
 	case 'c': copy(e, low, high, argc < 3 ? 1 : argv[2], argc < 4 ? 1 : argv[3]); break;
-	//case 'r': replace(e, low, high, str1,str2); break;
+	case 'r': replace(e, low, high, str1, str2); break;
 	case 'p': if (argc == 0) { high = e->count; } e->pos = high; /* fall-through */
 	case 'l': if (argc == 0) { low = 0; high = e->count; } (void)print(e, low, high); break;
 	case 'd': (void)delete(e, low, high); break;
 	case 'h': if (argc != 0) { question(e); break; } help(e); break;
 	case 'e': /* fall-through */
-	case 'w': if (argc == 0) { low = 0; high = e->count; } save(e, str, low, high); if (ch == 'e') return 1; break;
+	case 'w': if (argc == 0) { low = 0; high = e->count; } save(e, str1, low, high); if (ch == 'e') return 1; break;
 	case 'a': if (argc != 0) { question(e); break; } low = e->count; /* fall-through */
-	case 'i': e->pos = low; if (load_file(e, e->cmds, 1) < 0) return -1; break;
-	case 't': if (argc > 1) { question(e); break; } e->pos = low; str = str[0] ? str : e->file_name; if (load_name(e, str, 0) < 0) { msg(e, "%s?", str); } break;
+	case 'i': e->pos = low; if (load_file(e, e->cmds, 1, 0) < 0) return -1; break;
+	case 't': if (argc > 1) { question(e); break; } e->pos = low; str1 = str1[0] ? str1 : (char*)e->file_name; if (load_name(e, str1, 0, str1 != e->file_name) < 0) { msg(e, "%s?", str1); } break;
 	case 's': if (argc == 0) { high = e->count; } search(e, &line[1], low, high); break;
 	case '?': if (argc != 0) { question(e); break; }; msg(e, "file='%s' pos=%lu count=%lu", e->file_name, (unsigned long)e->pos, (unsigned long)e->count); break;
 	case 'v': if (argc > 1) { question(e); break; } e->verbose = low; break;
-	case '\0': if (argc == 1) { e->pos = low; break; /* TODO: Single line edit */ } /* fall-through */
-	default: question(e);
+	case '\0': if (argc == 1) { e->pos = low; if (load_file(e, e->cmds, 1, 1) < 0) return -1; (void)delete(e, e->pos, MIN(e->count, e->pos + 1ul)); break; } /* fall-through */
+	default: (void)question(e);
 	}
 	return 0;
 }
 
-static int editor(edit_t *e) {
+static int editor(edlin_t *e) {
 	assert(e);
 	e->pos = 0;
-	for (char line[256] = { 0, };fgets(line, sizeof (line) - 1, e->cmds);) {
-		const int r = edit_command(e, line);
-		if (r)
-			return r;
-		if (e->fatal)
-			return -1;
+	for (char line[256] = { 0, }; fgets(line, sizeof (line) - 1, e->cmds);) {
+		for (int i = 0, j = 0; line[i]; i++) {
+			if (line[i] == ';') {
+				line[i] = '\0';
+				const int r = edit_command(e, &line[j]);
+				if (r)        return r;
+				if (e->fatal) return -1;
+				j = i + 1;
+			}
+			if (line[i + 1] == '\0') {
+				const int r = edit_command(e, &line[j]);
+				if (r)        return r;
+				if (e->fatal) return -1;
+				break;
+			}
+			if (line[i] == '\\' && line[i + 1] == ';')
+				i++;
+		}
 	}
 	return 0;
 }
@@ -396,13 +534,14 @@ static int editor(edit_t *e) {
 int edlin(const char *file, FILE *cmds, FILE *msgs) {
 	assert(cmds);
 	assert(msgs);
-	edit_t e = {
+	edlin_t e = {
 		.file_name = file ? file : "", .line_ending = "\n", .eol = ".",
 		.msgs = msgs, .cmds = cmds,
 		.allocator = allocator, .arena = NULL,
+		.vfprintf = vfprintf, .fgetc = fgetc,
 	};
 	if (file)
-		(void)load_name(&e, file, 0);
+		(void)load_name(&e, (char*)file, 0, 0/*'file' string not modified if 0*/);
 	if (editor(&e) < 0)
 		goto fail;
 	return destroy(&e);
