@@ -102,13 +102,13 @@ Enter insert at the end of the file. This command updates the file position
 to end of the last inserted line. To exit insert mode type a single '.' 
 character on an empty line.
 
-* h
+* h OR ?
 
 Print out the help message. This is all.
 
-* ?
+* @
 
-Print information about the currently opened file.
+Print information about the currently opened file and editor state.
 
 * \[#\]\[,#\]s$
 

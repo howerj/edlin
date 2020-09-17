@@ -19,8 +19,6 @@
 #define MAX(X, Y) ((X) > (Y) ? (X) : (Y))
 #define DEFAULT_LINE_LENGTH (80ul)
 
-/* TODO: fix line numbers, better API, keep it small, more testing and assertions! */
-
 typedef struct {
 	char **lines;
 	const char *file_name, *line_ending, *eol;
@@ -28,10 +26,13 @@ typedef struct {
 	size_t line_length_limit, line_count_limit; /* optional limits, 0 = limit disabled */
 	FILE *msgs, *cmds;
 	int fatal, verbose;
+	/* --- porting code to a new platform --- */
 	allocator_fn allocator; /* memory allocator used in this editor */
 	void *arena;            /* memory arena (may be NULL) for allocator */
-	int (*fgetc)(FILE *in); /* TODO: Use this, replace fgets */
-	int (*vfprintf)(FILE *out, const char *fmt, va_list ap);
+	int   (*fgetc)(FILE *in);
+	int   (*vfprintf)(FILE *out, const char *fmt, va_list ap);
+	FILE *(*fopen)(const char *file, const char *mode);
+	int   (*fclose)(FILE *f);
 } edlin_t;
 
 static void *allocator(void *arena, void *ptr, const size_t oldsz, const size_t newsz) {
@@ -58,12 +59,13 @@ static void release(edlin_t *e, void *ptr) {
 
 static char *slurp(edlin_t *e, FILE *input, size_t *length) {
 	assert(e);
+	assert(e->fgetc);
 	assert(input);
 	assert(length);
 	size_t sz = 0, bsz = 0;
 	*length = 0;
 	char *m = NULL;
-	for (int ch = 0;(ch = fgetc(input)) != EOF;) {
+	for (int ch = 0;(ch = e->fgetc(input)) != EOF;) {
 		if (e->line_length_limit && bsz > e->line_length_limit) {
 			release(e, m);
 			return NULL;
@@ -227,7 +229,7 @@ static int print(edlin_t *e, size_t low, size_t high) {
 	if (low > high || high > e->count)
 		return question(e);
 	for (size_t i = low; i < high; i++) /* NB. Might want to optionally limit line length that is printed */
-		if (msg(e, "%4u%c %s", (unsigned)i, i == e->pos ? '*' : ':', e->lines[i]) < 0)
+		if (msg(e, "%4lu%c %s", (unsigned long)(i + 1u), i == e->pos ? '*' : ':', e->lines[i]) < 0)
 			return -1;
 	return 0;
 }
@@ -271,29 +273,33 @@ static int load_file(edlin_t *e, FILE *in, int interactive, size_t max_read) {
 
 static int load_name(edlin_t *e, char *name, int interactive, int escape) {
 	assert(e);
+	assert(e->fopen);
+	assert(e->fclose);
 	assert(name);
 	if (escape)
 		unescape(name, strlen(name) + 1ul);
-	FILE *in = fopen(name, "rb");
+	FILE *in = e->fopen(name, "rb");
 	if (!in) {
 		if (e->verbose)
 			msg(e, "t '%s'?", name);
 		return -1;
 	}
 	const int r = load_file(e, in, interactive, 0);
-	if (fclose(in) < 0)
+	if (e->fclose(in) < 0)
 		return -1;
 	return r;
 }
 
 static int save(edlin_t *e, const char *file_name, size_t low, size_t high) {
 	assert(e);
+	assert(e->fopen);
+	assert(e->fclose);
 	assert(file_name);
 	int r = 0;
 	if (low > high || high > e->count)
 		return question(e);
 	const char *name = file_name[0] ? file_name : e->file_name;
-	FILE *file = fopen(name, "wb");
+	FILE *file = e->fopen(name, "wb");
 	if (!file) {
 		(void)msg(e, "w '%s'?", name);
 		return -1;
@@ -303,7 +309,7 @@ static int save(edlin_t *e, const char *file_name, size_t low, size_t high) {
 		if ((r = edprint(e, file, "%s%s", e->lines[i], e->line_ending)) < 0)
 			break;
 	}
-	if (fclose(file) < 0)
+	if (e->fclose(file) < 0)
 		return -1;
 	if (e->verbose)
 		if (msg(e, "w '%s'%c", name, r < 0 ? '?' : ' ') < 0)
@@ -319,7 +325,7 @@ static int search(edlin_t *e, const char *string, size_t low, size_t high) {
 	for (size_t i = low; i < high; i++)
 		if (strstr(e->lines[i], string)) {
 			if (e->verbose)
-				if (msg(e, "%4lu: %s", (unsigned long)i, e->lines[i]) < 0)
+				if (msg(e, "%4lu: %s", (unsigned long)(i + 1ul), e->lines[i]) < 0)
 					return -1;
 			e->pos = i;
 			return 0;
@@ -420,7 +426,21 @@ static int number(edlin_t *e, const char *line, unsigned long *out, int *cnt) {
 	*cnt = 0;
 	if (line[0] == '.') { *out = e->pos;   *cnt = 1; return 1; }
 	if (line[0] == '$') { *out = e->count; *cnt = 1; return 1; }
-	return sscanf(line, "%lu%n", out, cnt); /* TODO: Remove dependency on sscanf */
+	//return sscanf(line, "%lu%n", out, cnt); /* TODO: Remove dependency on sscanf */
+	/* TODO: This code needs to work with '.' and '$' */
+	unsigned long n1 = 0, n2 = 0;
+	char ch = 0;
+	const int r = sscanf(line, "%lu%n%[-+]%n%lu%n", &n1, cnt, &ch, cnt, &n2, cnt);
+	if (r != 1 && r != 3)
+		return -1;
+	if (r == 3) {
+		if (ch != '+' && ch != '-')
+			return -1;
+		n1 += ch == '+' ? n2 : -n2;
+	}
+	if (r > 0)
+		*out = n1;
+	return r > 0 ? 1 : -1;
 }
 
 static int help(edlin_t *e) {
@@ -432,7 +452,7 @@ Email:   " EMAIL "\nRepo:    " REPO " \n\n\
 [#][,#]w<>  write file          | [#][,#]l    list lines (no cursor update)\n\
 [#][,#]d    delete lines        | [#]i        insert at cursor or line\n\
 [#][,#]p    print lines         | a           insert at end of file\n\
-h           print help          | ?           print info\n\
+? OR h      print help          | @           print editor info\n\
 [#][,#]s$   search for string   | [#]t<>      transfer file into line\n\
 [#]v        set verbosity level | #,[#],#m    move lines\n\
 [#][,#][,#][,#]c    copy lines  | [#][,#]r$   replace\n\
@@ -482,8 +502,14 @@ static int edit_command(edlin_t *e, char *line) {
 	unescape(str1, strlen(str1) + 1ul);
 	if (str2)
 		unescape(str2, strlen(str2) + 1ul);
+	/* TODO: Line number correction is still buggy */
+	low  -= !!low;
+	high -= !!high;
 
-	switch (ch) { /* TODO: More error checking on the number of arguments */
+	if (argc >= 4 && ch != 'c') { question(e); return 0; }
+	if (argc >= 3 && ch != 'c' && ch != 'm') { question(e); return 0; }
+
+	switch (ch) {
 	case 'q': if (argc != 0) { question(e); break; } return 1;
 	case 'm': move(e, low, high, argc == 3 ? argv[2] : 1); break;
 	case 'c': copy(e, low, high, argc < 3 ? 1 : argv[2], argc < 4 ? 1 : argv[3]); break;
@@ -491,6 +517,7 @@ static int edit_command(edlin_t *e, char *line) {
 	case 'p': if (argc == 0) { high = e->count; } e->pos = high; /* fall-through */
 	case 'l': if (argc == 0) { low = 0; high = e->count; } (void)print(e, low, high); break;
 	case 'd': (void)delete(e, low, high); break;
+	case '?': /* fall-through */
 	case 'h': if (argc != 0) { question(e); break; } help(e); break;
 	case 'e': /* fall-through */
 	case 'w': if (argc == 0) { low = 0; high = e->count; } save(e, str1, low, high); if (ch == 'e') return 1; break;
@@ -498,7 +525,7 @@ static int edit_command(edlin_t *e, char *line) {
 	case 'i': e->pos = low; if (load_file(e, e->cmds, 1, 0) < 0) return -1; break;
 	case 't': if (argc > 1) { question(e); break; } e->pos = low; str1 = str1[0] ? str1 : (char*)e->file_name; if (load_name(e, str1, 0, str1 != e->file_name) < 0) { msg(e, "%s?", str1); } break;
 	case 's': if (argc == 0) { high = e->count; } search(e, &line[1], low, high); break;
-	case '?': if (argc != 0) { question(e); break; }; msg(e, "file='%s' pos=%lu count=%lu", e->file_name, (unsigned long)e->pos, (unsigned long)e->count); break;
+	case '@': if (argc != 0) { question(e); break; }; msg(e, "file='%s' pos=%lu count=%lu", e->file_name, (unsigned long)e->pos, (unsigned long)e->count); break;
 	case 'v': if (argc > 1) { question(e); break; } e->verbose = low; break;
 	case '\0': if (argc == 1) { e->pos = low; if (load_file(e, e->cmds, 1, 1) < 0) return -1; (void)delete(e, e->pos, MIN(e->count, e->pos + 1ul)); break; } /* fall-through */
 	default: (void)question(e);
@@ -506,10 +533,31 @@ static int edit_command(edlin_t *e, char *line) {
 	return 0;
 }
 
+static char *get_string(edlin_t *e, char *line, size_t length, FILE *in) {
+	assert(e);
+	assert(e->fgetc);
+	assert(line);
+	assert(in);
+	if (length == 0ul)
+		return NULL;
+	memset(line, '\0', length);
+	if (length == 1ul)
+		return NULL;
+	size_t i = 0ul;
+	for (i = 0ul; i < (length - 1ul); i++) {
+		const int ch = e->fgetc(in);
+		if (ch == EOF || ch == '\n')
+			break;
+		line[i] = ch;
+	}
+	line[i] = '\0';
+	return i ? line : NULL;
+}
+
 static int editor(edlin_t *e) {
 	assert(e);
 	e->pos = 0;
-	for (char line[256] = { 0, }; fgets(line, sizeof (line) - 1, e->cmds);) {
+	for (char line[256] = { 0, }; get_string(e, line, sizeof(line), e->cmds);) {
 		for (int i = 0, j = 0; line[i]; i++) {
 			if (line[i] == ';') {
 				line[i] = '\0';
@@ -538,7 +586,7 @@ int edlin(const char *file, FILE *cmds, FILE *msgs) {
 		.file_name = file ? file : "", .line_ending = "\n", .eol = ".",
 		.msgs = msgs, .cmds = cmds,
 		.allocator = allocator, .arena = NULL,
-		.vfprintf = vfprintf, .fgetc = fgetc,
+		.vfprintf = vfprintf, .fgetc = fgetc, .fopen = fopen, .fclose = fclose,
 	};
 	if (file)
 		(void)load_name(&e, (char*)file, 0, 0/*'file' string not modified if 0*/);

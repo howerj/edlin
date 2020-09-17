@@ -1,9 +1,22 @@
 #!/bin/sh
-# TODO: test more commands once line numbers are fixed
 set -eux;
 TRC=${TRC:-}
 ED=edlin
 make ${ED};
+
+### File Creation Tests ###
+
+${TRC} ./${ED} creat.txt <<EOF
+e
+EOF
+
+rm -v creat.txt
+
+${TRC} ./${ED} creat.txt <<EOF
+wdifferent.txt
+EOF
+
+rm -v different.txt
 
 ### Basic Text Editing Test ###
 
@@ -51,6 +64,30 @@ EOF
 
 diff -w 4.txt 5.txt
 rm -v 4.txt 5.txt
+
+### Copy Lines ###
+
+COPY=$(cat <<EOF
+#include <stdio.h>
+
+int main(void) {
+	puts("Hello, World!");
+	puts("Hello, World!");
+	puts("Hello, World!");
+	return 0;
+}
+EOF
+);
+
+rm -fv 8.txt
+echo "${F1}"   > 6.txt
+echo "${COPY}" > 7.txt
+${TRC} ./${ED} 6.txt <<EOF
+4,4,1,2c;e8.txt
+EOF
+
+diff -w 7.txt 8.txt
+rm -v 6.txt 7.txt 8.txt
 
 ### END ###
 echo PASSED
