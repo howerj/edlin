@@ -19,20 +19,22 @@
 #define MAX(X, Y) ((X) > (Y) ? (X) : (Y))
 #define DEFAULT_LINE_LENGTH (80ul)
 
+typedef FILE *edlin_file_t;
+
 typedef struct {
 	char **lines;
 	const char *file_name, *line_ending, *eol;
 	size_t count, pos;                          /* line count, line cursor */
 	size_t line_length_limit, line_count_limit; /* optional limits, 0 = limit disabled */
-	FILE *msgs, *cmds;
+	edlin_file_t msgs, cmds;
 	int fatal, verbose;
 	/* --- porting code to a new platform --- */
 	allocator_fn allocator; /* memory allocator used in this editor */
 	void *arena;            /* memory arena (may be NULL) for allocator */
-	int   (*fgetc)(FILE *in);
-	int   (*vfprintf)(FILE *out, const char *fmt, va_list ap);
-	FILE *(*fopen)(const char *file, const char *mode);
-	int   (*fclose)(FILE *f);
+	int   (*fgetc)(edlin_file_t in);
+	int   (*vfprintf)(edlin_file_t out, const char *fmt, va_list ap);
+	edlin_file_t (*fopen)(const char *file, const char *mode);
+	int   (*fclose)(edlin_file_t f);
 } edlin_t;
 
 static void *allocator(void *arena, void *ptr, const size_t oldsz, const size_t newsz) {
@@ -57,7 +59,7 @@ static void release(edlin_t *e, void *ptr) {
 	(void)e->allocator(e->arena, ptr, 0, 0);
 }
 
-static char *slurp(edlin_t *e, FILE *input, size_t *length) {
+static char *slurp(edlin_t *e, edlin_file_t input, size_t *length) {
 	assert(e);
 	assert(e->fgetc);
 	assert(input);
@@ -91,7 +93,7 @@ static char *slurp(edlin_t *e, FILE *input, size_t *length) {
 	return m;
 }
 
-static int edprint(edlin_t *e, FILE *out, const char *fmt, ...) {
+static int edprint(edlin_t *e, edlin_file_t out, const char *fmt, ...) {
 	assert(e);
 	assert(e->msgs);
 	assert(e->vfprintf);
@@ -248,7 +250,7 @@ static int delete(edlin_t *e, size_t low, size_t high) {
 	return 0;
 }
 
-static int load_file(edlin_t *e, FILE *in, int interactive, size_t max_read) {
+static int load_file(edlin_t *e, edlin_file_t in, int interactive, size_t max_read) {
 	assert(e);
 	assert(in);
 	size_t length = 0, read_in = 0;
@@ -278,7 +280,7 @@ static int load_name(edlin_t *e, char *name, int interactive, int escape) {
 	assert(name);
 	if (escape)
 		unescape(name, strlen(name) + 1ul);
-	FILE *in = e->fopen(name, "rb");
+	edlin_file_t in = e->fopen(name, "rb");
 	if (!in) {
 		if (e->verbose)
 			msg(e, "t '%s'?", name);
@@ -299,7 +301,7 @@ static int save(edlin_t *e, const char *file_name, size_t low, size_t high) {
 	if (low > high || high > e->count)
 		return question(e);
 	const char *name = file_name[0] ? file_name : e->file_name;
-	FILE *file = e->fopen(name, "wb");
+	edlin_file_t file = e->fopen(name, "wb");
 	if (!file) {
 		(void)msg(e, "w '%s'?", name);
 		return -1;
@@ -533,7 +535,7 @@ static int edit_command(edlin_t *e, char *line) {
 	return 0;
 }
 
-static char *get_string(edlin_t *e, char *line, size_t length, FILE *in) {
+static char *get_string(edlin_t *e, char *line, size_t length, edlin_file_t in) {
 	assert(e);
 	assert(e->fgetc);
 	assert(line);
@@ -579,7 +581,7 @@ static int editor(edlin_t *e) {
 	return 0;
 }
 
-int edlin(const char *file, FILE *cmds, FILE *msgs) {
+int edlin(const char *file, edlin_file_t cmds, edlin_file_t msgs) {
 	assert(cmds);
 	assert(msgs);
 	edlin_t e = {

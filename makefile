@@ -1,4 +1,4 @@
-VERSION=0.9.3
+VERSION=0.9.4
 CFLAGS=-std=c99 -Wall -Wextra -pedantic -Os -g -DVERSION="\"${VERSION}\""
 TARGET=edlin
 DESTDIR=install
